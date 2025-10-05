@@ -1,2 +1,4 @@
 # runtime.txt
 python-3.11.9
+
+osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{s['id']}"
