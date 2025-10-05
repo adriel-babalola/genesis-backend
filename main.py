@@ -5,20 +5,17 @@ import httpx
 import os
 import json
 from typing import List, Dict, Any
+import urllib.parse
 
 # ======================
 # CONFIGURATION
 # ======================
 app = FastAPI(title="Genesis: NASA Space Biology Search Engine")
 
-# CORS — allow frontend (localhost + Vercel)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",           # Local dev
-        "https://genesis-frontend.vercel.app",  # Replace with your Vercel URL
-        "*"  # For demo flexibility (remove in production)
-    ],
+    allow_origins=["*"],  # For demo - restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,7 +28,10 @@ if not HF_TOKEN:
 
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-OSDR_BASE_URL = "https://osdr.nasa.gov/osdr/api/v1"
+
+# NASA OSDR API endpoints (CORRECT ONES)
+OSDR_SEARCH_URL = "https://osdr.nasa.gov/osdr/data/search"
+OSDR_META_URL = "https://osdr.nasa.gov/osdr/data/osd/meta"
 
 # ======================
 # MODELS
@@ -58,38 +58,119 @@ class ApiResponse(BaseModel):
 # HELPERS
 # ======================
 async def call_mistral(prompt: str) -> str:
+    """Call Mistral AI via Hugging Face"""
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            HF_API_URL,
-            headers=HF_HEADERS,
-            json={
-                "inputs": prompt,
-                "parameters": {
-                    "max_new_tokens": 300,
-                    "temperature": 0.1,
-                    "return_full_text": False
+        try:
+            response = await client.post(
+                HF_API_URL,
+                headers=HF_HEADERS,
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "max_new_tokens": 300,
+                        "temperature": 0.1,
+                        "return_full_text": False
+                    }
                 }
-            }
-        )
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Hugging Face API error: {response.text}"
             )
-        result = response.json()
-        return result[0]["generated_text"].strip()
+            if response.status_code != 200:
+                print(f"Mistral API error: {response.text}")
+                return ""
+            result = response.json()
+            return result[0]["generated_text"].strip()
+        except Exception as e:
+            print(f"Mistral call failed: {e}")
+            return ""
 
-def parse_study(osdr_data: Dict) -> StudyCard:
-    """Convert raw OSDR study metadata into a clean StudyCard."""
-    return StudyCard(
-        id=osdr_data.get("id", "N/A"),
-        title=osdr_data.get("title", "Untitled Study"),
-        organism=osdr_data.get("organism", "Unknown"),
-        mission=osdr_data.get("mission", "Unknown"),
-        assay_type=osdr_data.get("assay_type", "Unknown"),
-        principal_investigator=osdr_data.get("principal_investigator", "Anonymous"),
-        osdr_url=f"https://osdr.nasa.gov/osdr/studies/{osdr_data.get('id', '')}"
-    )
+def extract_study_metadata(study_data: Dict) -> StudyCard:
+    """Extract study metadata from NASA OSDR response"""
+    try:
+        # Get study comments which contain key metadata
+        study_info = study_data.get("study", {})
+        if isinstance(study_info, dict):
+            study_key = list(study_info.keys())[0]  # e.g., "OSD-137"
+            study_obj = study_info[study_key]
+        else:
+            study_obj = study_data
+        
+        # Extract from 'studies' array
+        studies = study_obj.get("additionalInformation", {}).get("description", {}).get("studies", [{}])
+        if studies:
+            main_study = studies[0]
+        else:
+            main_study = study_obj
+        
+        # Get study ID
+        study_id = study_obj.get("identifier", "N/A")
+        
+        # Get title
+        title = main_study.get("title", "Untitled Study")
+        
+        # Get organism from comments
+        organism = "Unknown"
+        mission = "Unknown"
+        assay_type = "Unknown"
+        pi = "Anonymous"
+        
+        comments = main_study.get("comments", [])
+        for comment in comments:
+            name = comment.get("name", "")
+            value = comment.get("value", "")
+            if name == "Mission Name":
+                mission = value
+        
+        # Get organism from organisms section
+        organisms_data = study_obj.get("additionalInformation", {}).get("organisms", {})
+        if organisms_data:
+            organism_keys = list(organisms_data.get("links", {}).keys())
+            if organism_keys:
+                organism = organism_keys[0].replace("_", " ").title()
+        
+        # Get assay type from assays
+        assays = study_obj.get("additionalInformation", {}).get("assays", {})
+        if assays:
+            assay_keys = list(assays.keys())
+            if assay_keys:
+                # Extract technology type from assay name
+                assay_name = assay_keys[0]
+                if "rna-seq" in assay_name.lower():
+                    assay_type = "RNA-Seq"
+                elif "microarray" in assay_name.lower():
+                    assay_type = "Microarray"
+                elif "mass-spec" in assay_name.lower():
+                    assay_type = "Mass Spectrometry"
+                elif "microscopy" in assay_name.lower():
+                    assay_type = "Microscopy"
+                else:
+                    assay_type = assay_name.split("_")[1] if "_" in assay_name else "Unknown"
+        
+        # Get PI from people
+        people = main_study.get("people", [])
+        for person in people:
+            if "Principal Investigator" in person.get("roles", []):
+                pi = f"{person.get('firstName', '')} {person.get('lastName', '')}".strip()
+                break
+        
+        return StudyCard(
+            id=study_id,
+            title=title,
+            organism=organism,
+            mission=mission,
+            assay_type=assay_type,
+            principal_investigator=pi,
+            osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{study_id}"
+        )
+    except Exception as e:
+        print(f"Error parsing study: {e}")
+        return StudyCard(
+            id="N/A",
+            title="Error parsing study",
+            organism="Unknown",
+            mission="Unknown",
+            assay_type="Unknown",
+            principal_investigator="Unknown",
+            osdr_url=""
+        )
 
 # ======================
 # ROUTES
@@ -100,130 +181,141 @@ async def search_nasa_biology(request: SearchRequest):
     if not user_query:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    # === STEP 1: Parse query with Mistral ===
-    parse_prompt = f"""
-    Extract biological search parameters from this query.
-    Output ONLY valid JSON with these keys (omit if unknown): organism, factor, tissue, mission.
-    Use scientific names (e.g., "Homo sapiens", not "human").
-    Query: "{user_query}"
-    """
-    try:
-        raw_output = await call_mistral(parse_prompt)
-        
-        # Clean potential markdown
-        if raw_output.startswith("```json"):
-            json_str = raw_output.split("```json", 1)[1].split("```", 1)[0]
-        elif raw_output.startswith("```"):
-            json_str = raw_output.split("```", 1)[1].split("```", 1)[0]
-        else:
-            json_str = raw_output
-        
-        parsed = json.loads(json_str)
-    except Exception as e:
-        # Fallback: use basic keyword matching
-        parsed = {}
-        if "arabidopsis" in user_query.lower():
-            parsed["organism"] = "Arabidopsis thaliana"
-        elif "mouse" in user_query.lower() or "mice" in user_query.lower():
-            parsed["organism"] = "Mus musculus"
-        if "radiation" in user_query.lower():
-            parsed["factor"] = "space radiation"
-        elif "microgravity" in user_query.lower():
-            parsed["factor"] = "microgravity"
-
-    # === STEP 2: Query NASA OSDR ===
-    filters = []
-    if "organism" in parsed:
-        filters.append(f'organism:"{parsed["organism"]}"')
-    if "factor" in parsed:
-        filters.append(f'factor:"{parsed["factor"]}"')
-    if "mission" in parsed:
-        filters.append(f'mission:"{parsed["mission"]}"')
+    # === STEP 1: Parse query with Mistral (optional - fallback to keyword matching) ===
+    parsed = {}
+    query_lower = user_query.lower()
     
-    if not filters:
-        return ApiResponse(
-            query=user_query,
-            ai_summary="Could not extract meaningful search terms. Try: 'Arabidopsis space radiation' or 'mouse microgravity ISS'.",
-            statistics={"total_studies": 0, "top_organism": "N/A", "missions": [], "assays": []},
-            study_cards=[]
-        )
-
-    query_string = " AND ".join(filters)
-    osdr_query_url = f"{OSDR_BASE_URL}/query?q={query_string}&format=json"
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    # Simple keyword extraction
+    if "arabidopsis" in query_lower:
+        parsed["organism"] = "Arabidopsis thaliana"
+    elif "mouse" in query_lower or "mice" in query_lower:
+        parsed["organism"] = "Mus musculus"
+    elif "human" in query_lower:
+        parsed["organism"] = "Homo sapiens"
+    
+    if "radiation" in query_lower:
+        parsed["term"] = "radiation"
+    elif "microgravity" in query_lower:
+        parsed["term"] = "microgravity"
+    elif "bone" in query_lower:
+        parsed["term"] = "bone"
+    elif "muscle" in query_lower:
+        parsed["term"] = "muscle"
+    
+    # === STEP 2: Query NASA OSDR Search API ===
+    search_params = {
+        "type": "cgene",  # NASA OSDR database
+        "size": 10  # Number of results
+    }
+    
+    # Build search query
+    if parsed.get("organism"):
+        search_params["ffield"] = "organism"
+        search_params["fvalue"] = parsed["organism"]
+    
+    if parsed.get("term"):
+        search_params["term"] = parsed["term"]
+    
+    if not search_params.get("term") and not search_params.get("ffield"):
+        # Use entire query as search term
+        search_params["term"] = user_query
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            osdr_resp = await client.get(osdr_query_url)
-            osdr_resp.raise_for_status()
-            osdr_data = osdr_resp.json()
+            # Search for studies
+            search_response = await client.get(OSDR_SEARCH_URL, params=search_params)
+            search_response.raise_for_status()
+            search_data = search_response.json()
+            
+            # Extract study IDs from search results
+            hits = search_data.get("hits", {}).get("hits", [])
+            if not hits:
+                return ApiResponse(
+                    query=user_query,
+                    ai_summary="No studies found matching your query. Try different keywords like 'mouse', 'radiation', or 'ISS'.",
+                    statistics={"total_studies": 0, "top_organism": "N/A", "missions": [], "assays": []},
+                    study_cards=[]
+                )
+            
+            # Get detailed metadata for top 5 studies
+            study_cards = []
+            for hit in hits[:5]:
+                source = hit.get("_source", {})
+                study_id = source.get("Accession", "").replace("GLDS-", "OSD-")
+                
+                if not study_id or study_id == "OSD-":
+                    continue
+                
+                try:
+                    # Fetch full metadata
+                    study_num = study_id.replace("OSD-", "")
+                    meta_url = f"{OSDR_META_URL}/{study_num}"
+                    meta_response = await client.get(meta_url)
+                    
+                    if meta_response.status_code == 200:
+                        meta_data = meta_response.json()
+                        study_card = extract_study_metadata(meta_data)
+                        study_cards.append(study_card)
+                except Exception as e:
+                    print(f"Error fetching metadata for {study_id}: {e}")
+                    continue
+            
+            if not study_cards:
+                return ApiResponse(
+                    query=user_query,
+                    ai_summary="Studies found but metadata could not be retrieved. Try a more specific query.",
+                    statistics={"total_studies": 0, "top_organism": "N/A", "missions": [], "assays": []},
+                    study_cards=[]
+                )
+            
+            # === STEP 3: Generate AI summary ===
+            context = "\n".join([
+                f"- {s.title} (Organism: {s.organism}, Mission: {s.mission})"
+                for s in study_cards
+            ])
+            
+            summary_prompt = f"""Summarize these NASA space biology studies in 2-3 sentences:
+{context}
+Focus on the main research themes and organisms studied."""
+            
+            ai_summary = await call_mistral(summary_prompt)
+            if not ai_summary:
+                ai_summary = f"Found {len(study_cards)} studies related to {user_query}. These studies investigate biological responses to spaceflight conditions."
+            
+            # Calculate statistics
+            organisms = [s.organism for s in study_cards if s.organism != "Unknown"]
+            missions = [s.mission for s in study_cards if s.mission != "Unknown"]
+            assays = [s.assay_type for s in study_cards if s.assay_type != "Unknown"]
+            
+            stats = {
+                "total_studies": len(study_cards),
+                "top_organism": organisms[0] if organisms else "Unknown",
+                "missions": list(set(missions)) if missions else ["Unknown"],
+                "assays": list(set(assays)) if assays else ["Unknown"]
+            }
+            
+            return ApiResponse(
+                query=user_query,
+                ai_summary=ai_summary,
+                statistics=stats,
+                study_cards=study_cards
+            )
+            
         except Exception as e:
+            print(f"NASA OSDR API error: {e}")
             raise HTTPException(
                 status_code=502,
                 detail=f"NASA OSDR API error: {str(e)}"
             )
 
-    # Normalize response (OSDR sometimes returns list, sometimes dict)
-    studies_list = osdr_data if isinstance(osdr_data, list) else osdr_data.get("studies", [])
-    if not studies_list:
-        return ApiResponse(
-            query=user_query,
-            ai_summary="No relevant studies found in NASA's Open Science Data Repository.",
-            statistics={"total_studies": 0, "top_organism": "N/A", "missions": [], "assays": []},
-            study_cards=[]
-        )
-
-    # Fetch full metadata for top 5 studies
-    study_ids = [s.get("id") for s in studies_list[:5] if s.get("id")]
-    full_studies = []
-    for sid in study_ids:
-        try:
-            study_resp = await client.get(f"{OSDR_BASE_URL}/studies/{sid}")
-            if study_resp.status_code == 200:
-                full_studies.append(study_resp.json())
-        except:
-            continue
-
-    study_cards = [parse_study(s) for s in full_studies]
-
-    # === STEP 3: Generate AI summary ===
-    if not study_cards:
-        ai_summary = "Studies found, but metadata could not be retrieved."
-        stats = {"total_studies": 0, "top_organism": "N/A", "missions": [], "assays": []}
-    else:
-        context = "\n".join([
-            f"- '{s.title}' ({s.organism}, Mission: {s.mission}, Assay: {s.assay_type})"
-            for s in study_cards
-        ])
-        summary_prompt = f"""
-        Summarize these NASA space biology studies in 2-3 clear sentences.
-        Then output ONLY a JSON object with: total_studies (int), top_organism (str), missions (list of str), assays (list of str).
-        Studies:
-        {context}
-        """
-        ai_output = await call_mistral(summary_prompt)
-
-        # Extract summary (before JSON)
-        if "{" in ai_output:
-            ai_summary = ai_output.split("{")[0].strip()
-            # TODO: Parse JSON stats properly in v2
-        else:
-            ai_summary = ai_output
-
-        # Basic stats (improve later with JSON parsing)
-        stats = {
-            "total_studies": len(study_cards),
-            "top_organism": study_cards[0].organism,
-            "missions": list(set(s.mission for s in study_cards)),
-            "assays": list(set(s.assay_type for s in study_cards))
-        }
-
-    return ApiResponse(
-        query=user_query,
-        ai_summary=ai_summary,
-        statistics=stats,
-        study_cards=study_cards
-    )
+@app.get("/")
+async def root():
+    return {"message": "Genesis Backend is LIVE", "status": "✅"}
 
 @app.get("/health")
 async def health_check():
-    return {"status": "✅ Genesis Backend is LIVE", "osdr_api": OSDR_BASE_URL}
+    return {
+        "status": "✅ Genesis Backend is LIVE",
+        "osdr_search_api": OSDR_SEARCH_URL,
+        "osdr_meta_api": OSDR_META_URL
+    }
