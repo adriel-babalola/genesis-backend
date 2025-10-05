@@ -27,7 +27,7 @@ if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN is missing! Set it in Render environment variables.")
 
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
 
 # NASA OSDR API endpoints (CORRECT ONES)
 OSDR_SEARCH_URL = "https://osdr.nasa.gov/osdr/data/search"
