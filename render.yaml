@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: genesis-backend
+    env: python
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: HF_TOKEN
+        sync: false
