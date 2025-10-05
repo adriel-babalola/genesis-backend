@@ -27,6 +27,7 @@ if not HF_TOKEN:
     raise ValueError("❌ HF_TOKEN is missing! Set it in Render environment variables.")
 
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# Use a working model - Mistral-7B-Instruct-v0.2 is publicly available
 HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
 
 # NASA OSDR API endpoints (CORRECT ONES)
@@ -59,7 +60,7 @@ class ApiResponse(BaseModel):
 # ======================
 async def call_mistral(prompt: str) -> str:
     """Call Mistral AI via Hugging Face"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.post(
                 HF_API_URL,
@@ -74,10 +75,16 @@ async def call_mistral(prompt: str) -> str:
                 }
             )
             if response.status_code != 200:
-                print(f"Mistral API error: {response.text}")
+                error_text = response.text
+                print(f"Mistral API error [{response.status_code}]: {error_text}")
+                # Model might be loading, return empty string to use fallback
                 return ""
             result = response.json()
-            return result[0]["generated_text"].strip()
+            # Handle different response formats
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and "generated_text" in result[0]:
+                    return result[0]["generated_text"].strip()
+            return ""
         except Exception as e:
             print(f"Mistral call failed: {e}")
             return ""
@@ -85,75 +92,102 @@ async def call_mistral(prompt: str) -> str:
 def extract_study_metadata(study_data: Dict) -> StudyCard:
     """Extract study metadata from NASA OSDR response"""
     try:
-        # Get study comments which contain key metadata
+        # Navigate to the actual study object
         study_info = study_data.get("study", {})
-        if isinstance(study_info, dict):
-            study_key = list(study_info.keys())[0]  # e.g., "OSD-137"
+        
+        # Get the first (and usually only) study key like "OSD-137"
+        if isinstance(study_info, dict) and study_info:
+            study_key = list(study_info.keys())[0]
             study_obj = study_info[study_key]
         else:
             study_obj = study_data
         
-        # Extract from 'studies' array
-        studies = study_obj.get("additionalInformation", {}).get("description", {}).get("studies", [{}])
-        if studies:
-            main_study = studies[0]
-        else:
-            main_study = study_obj
-        
         # Get study ID
         study_id = study_obj.get("identifier", "N/A")
         
-        # Get title
-        title = main_study.get("title", "Untitled Study")
+        # Navigate to the studies array for detailed metadata
+        studies_array = []
+        try:
+            studies_array = study_obj.get("studies", [])
+            if not studies_array:
+                # Try alternate path
+                studies_array = study_obj.get("additionalInformation", {}).get("description", {}).get("studies", [])
+        except:
+            pass
         
-        # Get organism from comments
+        main_study = studies_array[0] if studies_array else {}
+        
+        # Get title
+        title = main_study.get("title", study_obj.get("title", "Untitled Study"))
+        
+        # Initialize defaults
         organism = "Unknown"
         mission = "Unknown"
         assay_type = "Unknown"
         pi = "Anonymous"
         
+        # Extract from comments
         comments = main_study.get("comments", [])
         for comment in comments:
             name = comment.get("name", "")
             value = comment.get("value", "")
+            
             if name == "Mission Name":
                 mission = value
+            elif name == "Project Title" and mission == "Unknown":
+                mission = value
         
-        # Get organism from organisms section
-        organisms_data = study_obj.get("additionalInformation", {}).get("organisms", {})
-        if organisms_data:
-            organism_keys = list(organisms_data.get("links", {}).keys())
-            if organism_keys:
-                organism = organism_keys[0].replace("_", " ").title()
+        # Get organism - try multiple paths
+        try:
+            # Path 1: From organisms links
+            organisms_data = study_obj.get("additionalInformation", {}).get("organisms", {})
+            organism_links = organisms_data.get("links", {})
+            if organism_links:
+                organism_key = list(organism_links.keys())[0]
+                organism = organism_key.replace("musmusculus", "Mus musculus")
+                organism = organism.replace("arabidopsisthaliana", "Arabidopsis thaliana")
+                organism = organism.replace("homosapiens", "Homo sapiens")
+                organism = organism.replace("_", " ").title()
+        except:
+            pass
         
-        # Get assay type from assays
-        assays = study_obj.get("additionalInformation", {}).get("assays", {})
-        if assays:
-            assay_keys = list(assays.keys())
-            if assay_keys:
-                # Extract technology type from assay name
-                assay_name = assay_keys[0]
-                if "rna-seq" in assay_name.lower():
-                    assay_type = "RNA-Seq"
-                elif "microarray" in assay_name.lower():
-                    assay_type = "Microarray"
-                elif "mass-spec" in assay_name.lower():
-                    assay_type = "Mass Spectrometry"
-                elif "microscopy" in assay_name.lower():
-                    assay_type = "Microscopy"
-                else:
-                    assay_type = assay_name.split("_")[1] if "_" in assay_name else "Unknown"
+        # Get assay type - try multiple paths
+        try:
+            assays = study_obj.get("additionalInformation", {}).get("assays", {})
+            if assays:
+                assay_keys = list(assays.keys())
+                if assay_keys:
+                    assay_name = assay_keys[0].lower()
+                    
+                    if "rna-seq" in assay_name or "transcription-profiling" in assay_name:
+                        assay_type = "RNA-Seq"
+                    elif "microarray" in assay_name:
+                        assay_type = "Microarray"
+                    elif "mass-spec" in assay_name or "protein-expression" in assay_name:
+                        assay_type = "Mass Spectrometry"
+                    elif "microscopy" in assay_name or "imaging" in assay_name:
+                        assay_type = "Microscopy"
+                    elif "methylation" in assay_name or "bisulfite" in assay_name:
+                        assay_type = "DNA Methylation"
+                    else:
+                        assay_type = assay_name.split("_")[1].replace("-", " ").title() if "_" in assay_name else "Genomics"
+        except:
+            pass
         
-        # Get PI from people
+        # Get PI
         people = main_study.get("people", [])
         for person in people:
-            if "Principal Investigator" in person.get("roles", []):
-                pi = f"{person.get('firstName', '')} {person.get('lastName', '')}".strip()
-                break
+            roles = person.get("roles", [])
+            if any("Principal Investigator" in role for role in roles):
+                first = person.get("firstName", "")
+                last = person.get("lastName", "")
+                pi = f"{first} {last}".strip()
+                if pi:
+                    break
         
         return StudyCard(
             id=study_id,
-            title=title,
+            title=title[:200] if title else "Untitled Study",  # Limit title length
             organism=organism,
             mission=mission,
             assay_type=assay_type,
@@ -161,7 +195,9 @@ def extract_study_metadata(study_data: Dict) -> StudyCard:
             osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{study_id}"
         )
     except Exception as e:
-        print(f"Error parsing study: {e}")
+        print(f"Error parsing study metadata: {e}")
+        import traceback
+        traceback.print_exc()
         return StudyCard(
             id="N/A",
             title="Error parsing study",
@@ -229,6 +265,9 @@ async def search_nasa_biology(request: SearchRequest):
             
             # Extract study IDs from search results
             hits = search_data.get("hits", {}).get("hits", [])
+            
+            print(f"NASA Search returned {len(hits)} hits")
+            
             if not hits:
                 return ApiResponse(
                     query=user_query,
@@ -241,23 +280,83 @@ async def search_nasa_biology(request: SearchRequest):
             study_cards = []
             for hit in hits[:5]:
                 source = hit.get("_source", {})
-                study_id = source.get("Accession", "").replace("GLDS-", "OSD-")
+                
+                # Try multiple ways to get study ID
+                study_id = source.get("Accession", source.get("Study Identifier", ""))
+                
+                # Clean up ID format
+                if study_id.startswith("GLDS-"):
+                    study_id = study_id.replace("GLDS-", "OSD-")
+                elif not study_id.startswith("OSD-"):
+                    study_id = f"OSD-{study_id}" if study_id else ""
+                
+                print(f"Processing study: {study_id}")
                 
                 if not study_id or study_id == "OSD-":
+                    # Try to extract from hit itself
+                    title = source.get("Study Title", "Unknown Study")
+                    organism = source.get("organism", "Unknown")
+                    mission = source.get("Project Title", "Unknown")
+                    assay = source.get("Study Assay Technology Type", "Unknown")
+                    pi_list = source.get("Study Publication Author List", "")
+                    pi = pi_list.split(",")[0] if pi_list else "Unknown"
+                    
+                    study_cards.append(StudyCard(
+                        id=source.get("Accession", "N/A"),
+                        title=title[:200],
+                        organism=organism,
+                        mission=mission,
+                        assay_type=assay,
+                        principal_investigator=pi,
+                        osdr_url=f"https://osdr.nasa.gov/bio/repo/search?q={urllib.parse.quote(title)}"
+                    ))
                     continue
                 
                 try:
                     # Fetch full metadata
                     study_num = study_id.replace("OSD-", "")
                     meta_url = f"{OSDR_META_URL}/{study_num}"
-                    meta_response = await client.get(meta_url)
+                    
+                    print(f"Fetching metadata from: {meta_url}")
+                    
+                    meta_response = await client.get(meta_url, timeout=10.0)
                     
                     if meta_response.status_code == 200:
                         meta_data = meta_response.json()
                         study_card = extract_study_metadata(meta_data)
+                        
+                        # If metadata parsing failed, use search result data
+                        if study_card.title == "Untitled Study" or study_card.title == "Error parsing study":
+                            study_card.title = source.get("Study Title", study_card.title)[:200]
+                            study_card.organism = source.get("organism", study_card.organism)
+                            study_card.mission = source.get("Project Title", study_card.mission)
+                        
                         study_cards.append(study_card)
+                    else:
+                        print(f"Metadata fetch failed with status {meta_response.status_code}")
+                        # Fall back to search result data
+                        study_cards.append(StudyCard(
+                            id=study_id,
+                            title=source.get("Study Title", "Unknown Study")[:200],
+                            organism=source.get("organism", "Unknown"),
+                            mission=source.get("Project Title", "Unknown"),
+                            assay_type=source.get("Study Assay Technology Type", "Unknown"),
+                            principal_investigator=source.get("Study Publication Author List", "").split(",")[0] if source.get("Study Publication Author List") else "Unknown",
+                            osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{study_id}"
+                        ))
+                        
                 except Exception as e:
                     print(f"Error fetching metadata for {study_id}: {e}")
+                    # Use search result as fallback
+                    study_cards.append(StudyCard(
+                        id=study_id,
+                        title=source.get("Study Title", "Unknown Study")[:200],
+                        organism=source.get("organism", "Unknown"),
+                        mission=source.get("Project Title", "Unknown"),
+                        assay_type=source.get("Study Assay Technology Type", "Unknown"),
+                        principal_investigator="Unknown",
+                        osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{study_id}"
+                    ))
                     continue
             
             if not study_cards:
