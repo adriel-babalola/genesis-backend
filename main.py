@@ -1,12 +1,23 @@
-# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 import os
 from typing import List, Dict, Any
+from fastapi.middleware.cors import CORSMiddleware  # ← NEW IMPORT
 
 app = FastAPI(title="Genesis Backend")
 
+# 👇 CORS MIDDLEWARE 👇
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# 👆 END CORS 👆
+
+# ... rest of your code (HF_TOKEN, routes, etc.)
 # Get Hugging Face token from environment
 HF_TOKEN = os.getenv("HF_TOKEN")
 if not HF_TOKEN:
