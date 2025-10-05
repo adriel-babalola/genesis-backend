@@ -91,7 +91,7 @@ async def search(request: SearchRequest):
             mission=s["mission"],
             assay_type=s["assay_type"],
             principal_investigator=s["principal_investigator"],
-            osdr_url=f"https://osdr.nasa.gov/study/{s['id']}"
+            osdr_url=f"https://osdr.nasa.gov/bio/repo/data/studies/{s['id']}"
         )
         for s in mock_studies
     ]
